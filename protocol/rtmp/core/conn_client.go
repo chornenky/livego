@@ -2,6 +2,9 @@ package core
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -128,6 +131,45 @@ func (connClient *ConnClient) readRespMsg() error {
 	}
 }
 
+func (connClient *ConnClient) readConnRespMsg() (error, string) {
+	var err error
+	var rc ChunkStream
+	for {
+		if err = connClient.conn.Read(&rc); err != nil {
+			return err, ""
+		}
+		if err != nil && err != io.EOF {
+			return err, ""
+		}
+		switch rc.TypeID {
+		case 20, 17:
+			r := bytes.NewReader(rc.Data)
+			vs, _ := connClient.decoder.DecodeBatch(r, amf.AMF0)
+
+			log.Debugf("readRespMsg: vs=%v", vs)
+			for _, v := range vs {
+				switch v.(type) {
+				case amf.Object:
+					objmap := v.(amf.Object)
+					switch connClient.curcmdName {
+					case cmdConnect:
+						code, ok := objmap["code"]
+						if ok && code.(string) != connectSuccess {
+							var descr string
+							if d, ok := objmap["description"]; ok {
+								descr = d.(string)
+							}
+							return ErrFail, descr
+						}
+					}
+				}
+			}
+
+			return nil, ""
+		}
+	}
+}
+
 func (connClient *ConnClient) writeMsg(args ...interface{}) error {
 	connClient.bytesw.Reset()
 	for _, v := range args {
@@ -149,25 +191,77 @@ func (connClient *ConnClient) writeMsg(args ...interface{}) error {
 	return connClient.conn.Flush()
 }
 
-func (connClient *ConnClient) writeConnectMsg() error {
+type connectAuth struct {
+	stage                   int
+	salt, challenge, opaque string
+}
+
+func (connClient *ConnClient) writeConnectMsg(ca connectAuth) (error, string) {
 	event := make(amf.Object)
 	event["app"] = connClient.app
 	event["type"] = "nonprivate"
-	event["flashVer"] = "FMS.3.1"
+	event["flashVer"] = "FMLE/3.0 (compatible; Lavf58.45.100)"
 	event["tcUrl"] = connClient.tcurl
 	connClient.curcmdName = cmdConnect
 
+	var usr *neturl.Userinfo
+	if ca.stage > 0 {
+		u, err := neturl.Parse(connClient.url)
+		if err != nil {
+			return err, ""
+		}
+		if u.User == nil {
+			return errors.New("connect url has no user info, but it must have"), ""
+		}
+		usr = u.User
+	}
+
+	if ca.stage == 1 {
+		authStr := "?authmod=adobe&user=" + usr.Username()
+		event["app"] = connClient.app + authStr
+		event["tcUrl"] = connClient.tcurl + authStr
+	} else if ca.stage == 2 {
+		pwd, _ := usr.Password()
+		authStr := adobeAuth(usr.Username(), pwd, ca.salt, ca.opaque, ca.challenge)
+		event["app"] = connClient.app + "?" + authStr
+		event["tcUrl"] = connClient.tcurl + "?" + authStr
+	}
+
 	log.Debugf("writeConnectMsg: connClient.transID=%d, event=%v", connClient.transID, event)
 	if err := connClient.writeMsg(cmdConnect, connClient.transID, event); err != nil {
-		return err
+		return err, ""
 	}
-	return connClient.readRespMsg()
+
+	return connClient.readConnRespMsg()
+}
+
+func adobeAuth(user, password, salt, opaque, challenge string) string {
+	h := md5.New()
+	io.WriteString(h, user)
+	io.WriteString(h, salt)
+	io.WriteString(h, password)
+
+	hashStr := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	challenge2 := fmt.Sprintf("%08x", rand.Uint32())
+
+	h = md5.New()
+	io.WriteString(h, hashStr)
+	if opaque != "" {
+		io.WriteString(h, opaque)
+	} else if challenge != "" {
+		io.WriteString(h, challenge)
+	}
+	io.WriteString(h, challenge2)
+
+	hashStr = base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	return fmt.Sprintf("authmod=%s&user=%s&challenge=%s&response=%s&opaque=%s", "adobe", user, challenge2, hashStr, opaque)
 }
 
 func (connClient *ConnClient) writeCreateStreamMsg() error {
 	connClient.transID++
 	connClient.curcmdName = cmdCreateStream
-
 	log.Debugf("writeCreateStreamMsg: connClient.transID=%d", connClient.transID)
 	if err := connClient.writeMsg(cmdCreateStream, connClient.transID, nil); err != nil {
 		return err
@@ -222,7 +316,7 @@ func (connClient *ConnClient) Start(url string, method string) error {
 	connClient.app = ps[0]
 	connClient.title = ps[1]
 	connClient.query = u.RawQuery
-	connClient.tcurl = "rtmp://" + u.Host + "/" + connClient.app
+	connClient.tcurl = "rtmp://" + u.Host + ":1935" + "/" + connClient.app
 	port := ":1935"
 	host := u.Host
 	localIP := ":0"
@@ -270,11 +364,124 @@ func (connClient *ConnClient) Start(url string, method string) error {
 	if err := connClient.conn.HandshakeClient(); err != nil {
 		return err
 	}
+	connClient.conn.Flush()
 
 	log.Debug("writeConnectMsg....")
-	if err := connClient.writeConnectMsg(); err != nil {
-		return err
+	errC, descr := connClient.writeConnectMsg(connectAuth{})
+	if errC != nil && descr == "" {
+		return errC
 	}
+
+	//do auth
+	if errC != nil && descr != "" {
+		spl := strings.Split(descr, ":")
+
+		if len(spl) < 2 {
+			return errC
+		}
+
+		if u.User == nil {
+			return errors.New("connect url has no user info, but it must have")
+		}
+
+		if strings.Contains(spl[1], "code=403") {
+			if !strings.Contains(spl[1], "adobe") {
+				return errors.New("unknown authmod =" + spl[1])
+			}
+
+			log.Debug("stage 1")
+
+			conn, err := net.DialTCP("tcp", local, remote)
+			if err != nil {
+				log.Warning(err)
+				return err
+			}
+			connClient.conn = NewConn(conn, 4*1024)
+			log.Debug("HandshakeClient....")
+			if err := connClient.conn.HandshakeClient(); err != nil {
+				return err
+			}
+
+			log.Debug("writeConnectMsg....")
+			errC, descr := connClient.writeConnectMsg(connectAuth{
+				stage: 1,
+			})
+			if errC != nil && descr == "" {
+				return errC
+			}
+
+			if errC != nil && descr != "" {
+
+				spl = strings.Split(descr, ":")
+				fmt.Printf("%#v\n", spl)
+
+				if len(spl) < 2 {
+					return errC
+				}
+			}
+
+			if !strings.Contains(spl[1], "adobe") {
+				return errors.New("unknown auth mode")
+			}
+			var salt, user, challenge, opaque string
+
+			log.Debug("stage 2")
+			q, err := neturl.ParseQuery(strings.TrimSpace(spl[2]))
+			if err != nil || q == nil {
+				return errors.New("can't parse auth url from server")
+			}
+
+			user = q.Get("user")
+			if user == "" || user != u.User.Username() {
+				return errors.New("user is empty or doesn't equal to expected")
+			}
+			fixPlus := func(s string) string {
+				return strings.ReplaceAll(s, " ", "+")
+			}
+			salt = fixPlus(q.Get("salt"))
+			if salt == "" {
+				return errors.New("can't get salt")
+			}
+
+			challenge = fixPlus(q.Get("challenge"))
+			if challenge == "" {
+				// can be empty
+			}
+
+			opaque = fixPlus(q.Get("opaque"))
+			if opaque == "" {
+				// can be empty
+			}
+
+			conn, err = net.DialTCP("tcp", local, remote)
+			if err != nil {
+				log.Warning(err)
+				return err
+			}
+			connClient.conn = NewConn(conn, 4*1024)
+			log.Debug("HandshakeClient....")
+			if err := connClient.conn.HandshakeClient(); err != nil {
+				return err
+			}
+
+			log.Debug("writeConnectMsg....")
+			errC, descr = connClient.writeConnectMsg(connectAuth{
+				stage:     2,
+				salt:      salt,
+				challenge: challenge,
+				opaque:    opaque,
+			})
+			if errC != nil && descr == "" {
+				return errC
+			}
+
+			log.Infof("writeConnectMsg.... descr %v", descr)
+
+		} else {
+			return errC
+		}
+	}
+
 	log.Debug("writeCreateStreamMsg....")
 	if err := connClient.writeCreateStreamMsg(); err != nil {
 		log.Debug("writeCreateStreamMsg error", err)
