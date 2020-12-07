@@ -1,4 +1,4 @@
-module github.com/gwuhaolin/livego
+module github.com/chornenky/livego
 
 go 1.13
 
@@ -7,8 +7,9 @@ require (
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/go-redis/redis/v7 v7.2.0
 	github.com/gorilla/mux v1.7.4 // indirect
+	github.com/gwuhaolin/livego v0.0.0-20201112014954-4d921fa961a3
 	github.com/kr/pretty v0.1.0
-	github.com/orcaman/concurrent-map v0.0.0-20190826125027-8c72a8bb44f6
+	github.com/orcaman/concurrent-map v0.0.0-20190826125027-8c72a8bb44f6 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/satori/go.uuid v1.2.0
 	github.com/sirupsen/logrus v1.5.0

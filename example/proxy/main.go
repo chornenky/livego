@@ -9,7 +9,7 @@ import (
 	"math/rand"
 	"net"
 
-	"github.com/gwuhaolin/livego/protocol/rtmp"
+	"github.com/chornenky/livego/protocol/rtmp"
 	log "github.com/sirupsen/logrus"
 )
 
