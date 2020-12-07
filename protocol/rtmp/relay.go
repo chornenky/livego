@@ -1,6 +1,7 @@
 package rtmp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -10,7 +11,6 @@ import (
 	"github.com/chornenky/livego/configure"
 	"github.com/chornenky/livego/protocol/amf"
 	"github.com/chornenky/livego/protocol/rtmp/core"
-	"github.com/chornenky/livego/utils/uid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -19,15 +19,24 @@ type RelayAuthorizer interface {
 	LogOut(name string) error
 }
 
-type RelayServer struct {
-	handler    av.Handler
-	authorizer RelayAuthorizer
+type RelayServerOpts struct {
+	ReadTimeout, WriteTimeout time.Duration
 }
 
-func NewRelayServer(h av.Handler, authorizer RelayAuthorizer) *RelayServer {
+type RelayServer struct {
+	ctx                       context.Context
+	readTimeout, writeTimeout time.Duration
+	handler                   av.Handler
+	authorizer                RelayAuthorizer
+}
+
+func NewRelayServer(ctx context.Context, h av.Handler, authorizer RelayAuthorizer, opts RelayServerOpts) *RelayServer {
 	return &RelayServer{
-		handler:    h,
-		authorizer: authorizer,
+		ctx:          ctx,
+		readTimeout:  opts.ReadTimeout,
+		writeTimeout: opts.WriteTimeout,
+		handler:      h,
+		authorizer:   authorizer,
 	}
 }
 
@@ -104,7 +113,16 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 		}
 		log.Debug("handleConn: static publish is starting....")
 
-		wr := NewRelayWriter(reader.Info(), cc)
+		wr := NewRelayWriter(cc, reader.Info(), optsRelayWriter{
+			readTimeout:  s.readTimeout,
+			writeTimeout: s.writeTimeout,
+			onCloseFunc: func() {
+				log.Info("do logout....")
+				if err = s.authorizer.LogOut(name); err != nil {
+					log.Warn("logOut err", err)
+				}
+			},
+		})
 		s.handler.HandleWriter(wr)
 	} else {
 		log.Error("handleConn: server doesn't support play method")
@@ -114,8 +132,17 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 	return nil
 }
 
+type optsRelayWriter struct {
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	onCloseFunc  func()
+}
+
 type RelayWriter struct {
-	Uid    string
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	onCloseFunc  func()
+
 	closed bool
 	av.RWBaser
 	conn         *core.ConnClient
@@ -124,13 +151,25 @@ type RelayWriter struct {
 	lastPacketTS time.Time
 }
 
-func NewRelayWriter(info av.Info, conn *core.ConnClient) *RelayWriter {
+func NewRelayWriter(conn *core.ConnClient, info av.Info, opts optsRelayWriter) *RelayWriter {
+	wt := opts.writeTimeout
+	if wt == 0 {
+		wt = time.Second * time.Duration(writeTimeout)
+	}
+
+	to := opts.readTimeout
+	if to == 0 {
+		to = time.Second * time.Duration(readTimeout)
+	}
+
 	ret := &RelayWriter{
-		Uid:         uid.NewId(),
-		conn:        conn,
-		RWBaser:     av.NewRWBaser(time.Second * time.Duration(writeTimeout)),
-		packetQueue: make(chan *av.Packet, maxQueueNum),
-		info:        info,
+		readTimeout:  to,
+		writeTimeout: wt,
+		onCloseFunc:  opts.onCloseFunc,
+		conn:         conn,
+		RWBaser:      av.NewRWBaser(wt),
+		packetQueue:  make(chan *av.Packet, maxQueueNum),
+		info:         info,
 	}
 
 	go ret.Check()
@@ -148,16 +187,12 @@ func NewRelayWriter(info av.Info, conn *core.ConnClient) *RelayWriter {
 	return ret
 }
 
-const (
-	readTimeOut = time.Second * 5
-)
-
 func (v *RelayWriter) Check() {
 	//TODO made proper closed connection checker
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for range t.C {
-		if v.lastPacketTS.Add(readTimeOut).Before(time.Now()) {
+		if v.lastPacketTS.Add(v.readTimeout).Before(time.Now()) || !v.Alive() {
 			err := errors.New("read timeout, probably client is disconnected")
 			v.Close(err)
 			return
@@ -281,5 +316,6 @@ func (v *RelayWriter) Close(err error) {
 		close(v.packetQueue)
 	}
 	v.closed = true
+	v.onCloseFunc()
 	v.conn.Close(err)
 }

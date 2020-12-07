@@ -399,6 +399,7 @@ func (connClient *ConnClient) Start(url string, method string) error {
 			connClient.conn = NewConn(conn, 4*1024)
 			log.Debug("HandshakeClient....")
 			if err := connClient.conn.HandshakeClient(); err != nil {
+				log.Warning("handshakeClient error", err)
 				return err
 			}
 
@@ -407,11 +408,11 @@ func (connClient *ConnClient) Start(url string, method string) error {
 				stage: 1,
 			})
 			if errC != nil && descr == "" {
+				log.Warning("handshakeClient error", err)
 				return errC
 			}
 
 			if errC != nil && descr != "" {
-
 				spl = strings.Split(descr, ":")
 				fmt.Printf("%#v\n", spl)
 
@@ -455,12 +456,13 @@ func (connClient *ConnClient) Start(url string, method string) error {
 
 			conn, err = net.DialTCP("tcp", local, remote)
 			if err != nil {
-				log.Warning(err)
+				log.Warning("dialTCP err", err)
 				return err
 			}
 			connClient.conn = NewConn(conn, 4*1024)
 			log.Debug("HandshakeClient....")
 			if err := connClient.conn.HandshakeClient(); err != nil {
+				log.Warning("handshakeClient error", err)
 				return err
 			}
 
@@ -472,29 +474,33 @@ func (connClient *ConnClient) Start(url string, method string) error {
 				opaque:    opaque,
 			})
 			if errC != nil && descr == "" {
+				log.Warning("writeCreateStreamMsg error", err)
 				return errC
 			}
 
-			log.Infof("writeConnectMsg.... descr %v", descr)
+			log.Info("writeConnectMsg.... successfully connected")
 
 		} else {
+			log.Warning("writeCreateStreamMsg error", err)
 			return errC
 		}
 	}
 
 	log.Debug("writeCreateStreamMsg....")
 	if err := connClient.writeCreateStreamMsg(); err != nil {
-		log.Debug("writeCreateStreamMsg error", err)
+		log.Warning("writeCreateStreamMsg error", err)
 		return err
 	}
 
 	log.Debug("method control:", method, av.PUBLISH, av.PLAY)
 	if method == av.PUBLISH {
 		if err := connClient.writePublishMsg(); err != nil {
+			log.Warning("writePublishMsg error", err)
 			return err
 		}
 	} else if method == av.PLAY {
 		if err := connClient.writePlayMsg(); err != nil {
+			log.Warning("writePlayMsg error", err)
 			return err
 		}
 	}

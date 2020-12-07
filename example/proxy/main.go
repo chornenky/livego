@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"time"
 
 	"github.com/chornenky/livego/protocol/rtmp"
 	log "github.com/sirupsen/logrus"
@@ -41,7 +43,7 @@ func adobeAuth(user, password, salt, opaque, challenge string) string {
 type auth struct{}
 
 func (a auth) Authorize(app, name string) (endpoint string, err error) {
-	if app == "12" {
+	if app == "live" {
 		return "rtmp://127.0.0.1/live/live3", nil
 	}
 
@@ -70,7 +72,10 @@ func main() {
 	*/
 
 	stream := rtmp.NewRtmpStream()
-	rtmpServer := rtmp.NewRelayServer(stream, &auth{})
+	rtmpServer := rtmp.NewRelayServer(context.Background(), stream, &auth{}, rtmp.RelayServerOpts{
+		ReadTimeout:  time.Duration(time.Second * 10),
+		WriteTimeout: time.Duration(time.Second * 10),
+	})
 	rtmpListen, err := net.Listen("tcp", rtmpAddr)
 	if err != nil {
 		log.Fatal(err)
