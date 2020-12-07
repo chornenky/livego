@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/gwuhaolin/livego/utils/pool"
+	"github.com/chornenky/livego/utils/pool"
 
 	"github.com/stretchr/testify/assert"
 )
