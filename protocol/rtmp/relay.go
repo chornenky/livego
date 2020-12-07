@@ -16,6 +16,7 @@ import (
 
 type RelayAuthorizer interface {
 	Authorize(app, name string) (endpoint string, err error)
+	LogOut(name string) error
 }
 
 type RelayServer struct {
@@ -33,7 +34,7 @@ func NewRelayServer(h av.Handler, authorizer RelayAuthorizer) *RelayServer {
 func (s *RelayServer) Serve(listener net.Listener) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error("rtmp serve panic: ", r)
+			log.Error("serve: rtmp serve panic: ", r)
 		}
 	}()
 
@@ -44,7 +45,7 @@ func (s *RelayServer) Serve(listener net.Listener) (err error) {
 			return
 		}
 		conn := core.NewConn(netconn, 4*1024)
-		log.Debug("new client, connect remote: ", conn.RemoteAddr().String(),
+		log.Debug("serve: new client, connect remote: ", conn.RemoteAddr().String(),
 			"local:", conn.LocalAddr().String())
 		go s.handleConn(conn)
 	}
@@ -53,20 +54,20 @@ func (s *RelayServer) Serve(listener net.Listener) (err error) {
 func (s *RelayServer) handleConn(conn *core.Conn) error {
 	closeWithLog := func() {
 		if err := conn.Close(); err != nil {
-			log.Error("handleConn can't close conn err: ", err)
+			log.Error("handleConn: can't close conn err: ", err)
 		}
 	}
 
 	if err := conn.HandshakeServer(); err != nil {
 		closeWithLog()
-		log.Error("handleConn HandshakeServer err: ", err)
+		log.Error("handleConn: HandshakeServer err: ", err)
 		return err
 	}
 	connServer := core.NewConnServer(conn)
 
 	if err := connServer.ReadMsg(); err != nil {
 		closeWithLog()
-		log.Error("handleConn read msg err: ", err)
+		log.Error("handleConn: read msg err: ", err)
 		return err
 	}
 
@@ -75,34 +76,38 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 		// host:port/first/sec
 		// appName = first, name = sec
 		appName, name, _ := connServer.GetInfo()
+		log.Infof("handleConn: client is establishing a connection appName=%v name=%v", appName, name)
+
 		rtmpAddr, err := s.authorizer.Authorize(appName, name)
 		if err != nil {
 			errW := fmt.Errorf("invalid key, %w", err)
 			closeWithLog()
-			log.Error("CheckKey err: ", errW)
+			log.Errorf("handleConn: checkKey failed err=%v", errW)
 			return errW
 		}
 
+		log.Infof("handleConn: client successfully connected appName=%v name=%v", appName, name)
+
 		connServer.PublishInfo.Name = name
 		if pushlist, ret := configure.GetStaticPushUrlList(appName); ret && (pushlist != nil) {
-			log.Debugf("GetStaticPushUrlList: %v", pushlist)
+			log.Debugf("handleConn: GetStaticPushUrlList: %v", pushlist)
 		}
 		reader := NewVirReader(connServer)
 		s.handler.HandleReader(reader)
-		log.Debugf("new publisher: %+v", reader.Info())
+		log.Debugf("handleConn: new publisher: %+v", reader.Info())
 
 		cc := core.NewConnClient()
-		log.Debugf("static publish server addr:%v starting....", rtmpAddr)
 		if err = cc.Start(rtmpAddr, "publish"); err != nil {
 			log.Debugf("connectClient.Start url=%v error", rtmpAddr)
 			closeWithLog()
 			return err
 		}
+		log.Debug("handleConn: static publish is starting....")
 
 		wr := NewRelayWriter(reader.Info(), cc)
 		s.handler.HandleWriter(wr)
 	} else {
-		log.Error("Server doesn't support play method")
+		log.Error("handleConn: server doesn't support play method")
 		closeWithLog()
 	}
 
@@ -154,7 +159,6 @@ func (v *RelayWriter) Check() {
 	for range t.C {
 		if v.lastPacketTS.Add(readTimeOut).Before(time.Now()) {
 			err := errors.New("read timeout, probably client is disconnected")
-			fmt.Println("closed conn")
 			v.Close(err)
 			return
 		}

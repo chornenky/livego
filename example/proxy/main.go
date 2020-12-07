@@ -48,6 +48,10 @@ func (a auth) Authorize(app, name string) (endpoint string, err error) {
 	return "", errors.New("unknown app")
 }
 
+func (a auth) LogOut(name string) error {
+	return nil
+}
+
 func main() {
 
 	rtmpAddr := ":1934"
