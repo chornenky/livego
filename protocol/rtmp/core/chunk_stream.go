@@ -32,7 +32,8 @@ func (chunkStream *ChunkStream) new(pool *pool.Pool) {
 	chunkStream.got = false
 	chunkStream.index = 0
 	chunkStream.remain = chunkStream.Length
-	chunkStream.Data = pool.Get(int(chunkStream.Length))
+	_ = pool
+	chunkStream.Data = make([]byte, chunkStream.Length)
 }
 
 func (chunkStream *ChunkStream) writeHeader(w *ReadWriter) error {
