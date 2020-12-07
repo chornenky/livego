@@ -6,10 +6,10 @@ import (
 	"net"
 	"time"
 
+	"github.com/chornenky/livego/protocol/rtmp/core"
 	"github.com/gwuhaolin/livego/av"
 	"github.com/gwuhaolin/livego/configure"
 	"github.com/gwuhaolin/livego/protocol/amf"
-	"github.com/gwuhaolin/livego/protocol/rtmp/core"
 	"github.com/gwuhaolin/livego/utils/uid"
 	log "github.com/sirupsen/logrus"
 )
