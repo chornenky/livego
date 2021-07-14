@@ -414,7 +414,7 @@ func (connClient *ConnClient) Start(url string, method string) error {
 
 			if errC != nil && descr != "" {
 				spl = strings.Split(descr, ":")
-				fmt.Printf("%#v\n", spl)
+				//fmt.Printf("%#v\n", spl)
 
 				if len(spl) < 2 {
 					return errC
@@ -478,13 +478,12 @@ func (connClient *ConnClient) Start(url string, method string) error {
 				return errC
 			}
 
-			log.Info("writeConnectMsg.... successfully connected")
-
 		} else {
 			log.Warning("writeCreateStreamMsg error", err)
 			return errC
 		}
 	}
+	log.Infof("writeConnectMsg.... successfully connected to %s", connClient.tcurl)
 
 	log.Debug("writeCreateStreamMsg....")
 	if err := connClient.writeCreateStreamMsg(); err != nil {

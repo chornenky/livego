@@ -9,7 +9,6 @@ import (
 
 	"github.com/chornenky/livego/av"
 	"github.com/chornenky/livego/configure"
-	"github.com/chornenky/livego/protocol/amf"
 	"github.com/chornenky/livego/protocol/rtmp/core"
 	log "github.com/sirupsen/logrus"
 )
@@ -101,10 +100,10 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 		if pushlist, ret := configure.GetStaticPushUrlList(appName); ret && (pushlist != nil) {
 			log.Debugf("handleConn: GetStaticPushUrlList: %v", pushlist)
 		}
+
 		reader := NewVirReader(connServer)
 		s.handler.HandleReader(reader)
 		log.Debugf("handleConn: new publisher: %+v", reader.Info())
-
 		cc := core.NewConnClient()
 		if err = cc.Start(rtmpAddr, "publish"); err != nil {
 			log.Debugf("connectClient.Start url=%v error", rtmpAddr)
@@ -113,14 +112,16 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 		}
 		log.Debug("handleConn: static publish is starting....")
 
-		wr := NewRelayWriter(cc, reader.Info(), optsRelayWriter{
+		wr := NewRelayWriter(cc, reader, optsRelayWriter{
 			readTimeout:  s.readTimeout,
 			writeTimeout: s.writeTimeout,
 			onCloseFunc: func() {
-				log.Info("do logout....")
+				log.Infof("do logout... stream %v", name)
 				if err = s.authorizer.LogOut(name); err != nil {
 					log.Warn("logOut err", err)
 				}
+				log.Infof("close streamer connection %v", name)
+				closeWithLog()
 			},
 		})
 		s.handler.HandleWriter(wr)
@@ -142,16 +143,16 @@ type RelayWriter struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 	onCloseFunc  func()
-
-	closed bool
+	closed       bool
 	av.RWBaser
-	conn         *core.ConnClient
-	packetQueue  chan *av.Packet
-	info         av.Info
-	lastPacketTS time.Time
+
+	dstConn   *core.ConnClient
+	srcReader *VirReader
+
+	packetQueue chan *av.Packet
 }
 
-func NewRelayWriter(conn *core.ConnClient, info av.Info, opts optsRelayWriter) *RelayWriter {
+func NewRelayWriter(dstConn *core.ConnClient, srcReader *VirReader, opts optsRelayWriter) *RelayWriter {
 	wt := opts.writeTimeout
 	if wt == 0 {
 		wt = time.Second * time.Duration(writeTimeout)
@@ -166,10 +167,10 @@ func NewRelayWriter(conn *core.ConnClient, info av.Info, opts optsRelayWriter) *
 		readTimeout:  to,
 		writeTimeout: wt,
 		onCloseFunc:  opts.onCloseFunc,
-		conn:         conn,
 		RWBaser:      av.NewRWBaser(wt),
+		dstConn:      dstConn,
+		srcReader:    srcReader,
 		packetQueue:  make(chan *av.Packet, maxQueueNum),
-		info:         info,
 	}
 
 	go ret.Check()
@@ -178,8 +179,10 @@ func NewRelayWriter(conn *core.ConnClient, info av.Info, opts optsRelayWriter) *
 		if err != nil {
 			log.Warning(err)
 			if ret.closed {
-				log.Info("stop forwarding, client is disconnected")
+				log.Infof("stop forwarding, client is disconnected %v", ret.srcReader.Info().URL)
 				return
+			} else {
+				ret.Close(err)
 			}
 		}
 	}()
@@ -188,12 +191,11 @@ func NewRelayWriter(conn *core.ConnClient, info av.Info, opts optsRelayWriter) *
 }
 
 func (v *RelayWriter) Check() {
-	//TODO made proper closed connection checker
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for range t.C {
-		if v.lastPacketTS.Add(v.readTimeout).Before(time.Now()) || !v.Alive() {
-			err := errors.New("read timeout, probably client is disconnected")
+		if !v.Alive() || !v.srcReader.Alive() {
+			err := errors.New("r/w timeout, probably the client is disconnected or remote server's closed the connection")
 			v.Close(err)
 			return
 		}
@@ -212,7 +214,6 @@ func (v *RelayWriter) DropPacket(pktQue chan *av.Packet, info av.Info) {
 			} else {
 				pktQue <- tmpPkt
 			}
-
 		}
 
 		if ok && tmpPkt.IsVideo {
@@ -226,37 +227,21 @@ func (v *RelayWriter) DropPacket(pktQue chan *av.Packet, info av.Info) {
 				<-pktQue
 			}
 		}
-
 	}
 	log.Debug("packet queue len: ", len(pktQue))
 }
 
 func (v *RelayWriter) Write(p *av.Packet) error {
-	v.lastPacketTS = time.Now()
-
-	typeID := av.TAG_VIDEO
-	if !p.IsVideo {
-		if p.IsMetadata {
-			var err error
-			typeID = av.TAG_SCRIPTDATAAMF0
-			p.Data, err = amf.MetaDataReform(p.Data, amf.DEL)
-			if err != nil {
-				return err
-			}
-		} else {
-			typeID = av.TAG_AUDIO
-		}
-	}
-
 	v.RWBaser.SetPreTime()
-	timestamp := p.TimeStamp
-	timestamp += v.BaseTimeStamp()
-	v.RWBaser.RecTimeStamp(timestamp, uint32(typeID))
 
 	var err error = nil
+	if v.closed {
+		err = fmt.Errorf("RelayWriter closed")
+		return err
+	}
 	defer func() {
 		if e := recover(); e != nil {
-			err = fmt.Errorf("RelayWriter has already been closed:%v", e)
+			err = fmt.Errorf("RelayWriter has already been closed: %v", e)
 		}
 	}()
 
@@ -270,25 +255,18 @@ func (v *RelayWriter) Write(p *av.Packet) error {
 }
 
 func (v *RelayWriter) SendPacket() error {
-	//if !self.startflag {
-	//	return
-	//}
 	var cs core.ChunkStream
-
 	for {
 		p, ok := <-v.packetQueue
 		if !ok {
-			return fmt.Errorf("data channel is closed\n")
+			return fmt.Errorf("data channel is closed")
 		}
 
 		cs.Data = p.Data
 		cs.Length = uint32(len(p.Data))
-		cs.StreamID = v.conn.GetStreamId()
+		cs.StreamID = v.dstConn.GetStreamId()
 		cs.Timestamp = p.TimeStamp
-		//cs.Timestamp += v.BaseTimeStamp()
 
-		//log.Printf("Static sendPacket: rtmpurl=%s, length=%d, streamid=%d",
-		//	self.RtmpUrl, len(p.Data), cs.StreamID)
 		if p.IsVideo {
 			cs.TypeID = av.TAG_VIDEO
 		} else {
@@ -299,23 +277,24 @@ func (v *RelayWriter) SendPacket() error {
 			}
 		}
 
-		if err := v.conn.Write(cs); err != nil {
-			log.Errorf("can't write packet to connection %v", err)
+		if err := v.dstConn.Write(cs); err != nil {
+			v.closed = true
+			log.Errorf("can't write packet to destination for stream %v, err %v", v.srcReader.Info().URL, err)
 			return err
 		}
 	}
 }
 
 func (v *RelayWriter) Info() av.Info {
-	return v.info
+	return v.srcReader.Info()
 }
 
 func (v *RelayWriter) Close(err error) {
-	log.Warning("publisher ", v.Info(), "closed: "+err.Error())
+	log.Warningf("publisher %v is closed due err %v", v.Info(), err.Error())
 	if !v.closed {
 		close(v.packetQueue)
 	}
 	v.closed = true
 	v.onCloseFunc()
-	v.conn.Close(err)
+	v.dstConn.Close(err)
 }
