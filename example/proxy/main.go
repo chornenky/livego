@@ -73,9 +73,10 @@ func main() {
 
 	stream := rtmp.NewRtmpStream()
 	rtmpServer := rtmp.NewRelayServer(context.Background(), stream, &auth{}, rtmp.RelayServerOpts{
-		ReadTimeout:  time.Duration(time.Second * 10),
-		WriteTimeout: time.Duration(time.Second * 10),
-	})
+		ReadTimeout:      time.Duration(time.Second * 10),
+		WriteTimeout:     time.Duration(time.Second * 10),
+		IsSynchronizedRW: true, // to synchronize read and write speed
+	}, new(rtmp.RelayMetrics))
 	rtmpListen, err := net.Listen("tcp", rtmpAddr)
 	if err != nil {
 		log.Fatal(err)

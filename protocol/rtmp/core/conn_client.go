@@ -32,6 +32,10 @@ var (
 	ErrFail = fmt.Errorf("respone err")
 )
 
+const (
+	DefaultBufferSize = 4 * 1024
+)
+
 type ConnClient struct {
 	done       bool
 	transID    int
@@ -51,7 +55,7 @@ type ConnClient struct {
 func NewConnClient() *ConnClient {
 	return &ConnClient{
 		transID: 1,
-		bytesw:  bytes.NewBuffer(nil),
+		bytesw:  bytes.NewBuffer(make([]byte, 0, DefaultBufferSize)),
 		encoder: &amf.Encoder{},
 		decoder: &amf.Decoder{},
 	}
@@ -357,8 +361,7 @@ func (connClient *ConnClient) Start(url string, method string) error {
 	}
 
 	log.Debug("connection:", "local:", conn.LocalAddr(), "remote:", conn.RemoteAddr())
-
-	connClient.conn = NewConn(conn, 4*1024)
+	connClient.conn = NewConn(conn, DefaultBufferSize)
 
 	log.Debug("HandshakeClient....")
 	if err := connClient.conn.HandshakeClient(); err != nil {
@@ -396,7 +399,7 @@ func (connClient *ConnClient) Start(url string, method string) error {
 				log.Warning(err)
 				return err
 			}
-			connClient.conn = NewConn(conn, 4*1024)
+			connClient.conn = NewConn(conn, DefaultBufferSize)
 			log.Debug("HandshakeClient....")
 			if err := connClient.conn.HandshakeClient(); err != nil {
 				log.Warning("handshakeClient error", err)
@@ -459,7 +462,7 @@ func (connClient *ConnClient) Start(url string, method string) error {
 				log.Warning("dialTCP err", err)
 				return err
 			}
-			connClient.conn = NewConn(conn, 4*1024)
+			connClient.conn = NewConn(conn, DefaultBufferSize)
 			log.Debug("HandshakeClient....")
 			if err := connClient.conn.HandshakeClient(); err != nil {
 				log.Warning("handshakeClient error", err)

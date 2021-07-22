@@ -90,7 +90,7 @@ func (s *Server) Serve(listener net.Listener) (err error) {
 		if err != nil {
 			return
 		}
-		conn := core.NewConn(netconn, 4*1024)
+		conn := core.NewConn(netconn, core.DefaultBufferSize)
 		log.Debug("new client, connect remote: ", conn.RemoteAddr().String(),
 			"local:", conn.LocalAddr().String())
 		go s.handleConn(conn)
@@ -242,7 +242,7 @@ func (v *VirWriter) Check() {
 }
 
 func (v *VirWriter) DropPacket(pktQue chan *av.Packet, info av.Info) {
-	log.Warningf("[%v] packet queue max!!!", info)
+	log.Warningf("VirWriter [%v] packet queue max!!!", info)
 	for i := 0; i < maxQueueNum-84; i++ {
 		tmpPkt, ok := <-pktQue
 		// try to don't drop audio

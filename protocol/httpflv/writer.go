@@ -56,7 +56,7 @@ func NewFLVWriter(app, title, url string, ctx http.ResponseWriter) *FLVWriter {
 }
 
 func (flvWriter *FLVWriter) DropPacket(pktQue chan *av.Packet, info av.Info) {
-	log.Warningf("[%v] packet queue max!!!", info)
+	log.Warningf("FLVWriter [%v] packet queue max!!!", info)
 	for i := 0; i < maxQueueNum-84; i++ {
 		tmpPkt, ok := <-pktQue
 		if ok && tmpPkt.IsVideo {

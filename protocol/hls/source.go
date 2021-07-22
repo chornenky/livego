@@ -71,7 +71,7 @@ func (source *Source) GetCacheInc() *TSCacheItem {
 }
 
 func (source *Source) DropPacket(pktQue chan *av.Packet, info av.Info) {
-	log.Warningf("[%v] packet queue max!!!", info)
+	log.Warningf("Source [%v] packet queue max!!!", info)
 	for i := 0; i < maxQueueNum-84; i++ {
 		tmpPkt, ok := <-pktQue
 		// try to don't drop audio

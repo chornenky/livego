@@ -20,22 +20,27 @@ type RelayAuthorizer interface {
 
 type RelayServerOpts struct {
 	ReadTimeout, WriteTimeout time.Duration
+	IsSynchronizedRW          bool
 }
 
 type RelayServer struct {
 	ctx                       context.Context
+	m                         MetricsCollector
 	readTimeout, writeTimeout time.Duration
+	isSynchronizedRW          bool
 	handler                   av.Handler
 	authorizer                RelayAuthorizer
 }
 
-func NewRelayServer(ctx context.Context, h av.Handler, authorizer RelayAuthorizer, opts RelayServerOpts) *RelayServer {
+func NewRelayServer(ctx context.Context, h av.Handler, authorizer RelayAuthorizer, opts RelayServerOpts, metrics MetricsCollector) *RelayServer {
 	return &RelayServer{
-		ctx:          ctx,
-		readTimeout:  opts.ReadTimeout,
-		writeTimeout: opts.WriteTimeout,
-		handler:      h,
-		authorizer:   authorizer,
+		ctx:              ctx,
+		m:                metrics,
+		readTimeout:      opts.ReadTimeout,
+		writeTimeout:     opts.WriteTimeout,
+		isSynchronizedRW: opts.IsSynchronizedRW,
+		handler:          h,
+		authorizer:       authorizer,
 	}
 }
 
@@ -52,7 +57,7 @@ func (s *RelayServer) Serve(listener net.Listener) (err error) {
 		if err != nil {
 			return
 		}
-		conn := core.NewConn(netconn, 4*1024)
+		conn := core.NewConn(netconn, core.DefaultBufferSize)
 		log.Debug("serve: new client, connect remote: ", conn.RemoteAddr().String(),
 			"local:", conn.LocalAddr().String())
 		go s.handleConn(conn)
@@ -112,9 +117,12 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 		}
 		log.Debug("handleConn: static publish is starting....")
 
+		s.m.IncStream(name)
 		wr := NewRelayWriter(cc, reader, optsRelayWriter{
-			readTimeout:  s.readTimeout,
-			writeTimeout: s.writeTimeout,
+			readTimeout:      s.readTimeout,
+			writeTimeout:     s.writeTimeout,
+			IsSynchronizedRW: s.isSynchronizedRW,
+			m:                s.m,
 			onCloseFunc: func() {
 				log.Infof("do logout... stream %v", name)
 				if err = s.authorizer.LogOut(name); err != nil {
@@ -134,14 +142,17 @@ func (s *RelayServer) handleConn(conn *core.Conn) error {
 }
 
 type optsRelayWriter struct {
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	onCloseFunc  func()
+	readTimeout      time.Duration
+	writeTimeout     time.Duration
+	IsSynchronizedRW bool
+	m                MetricsCollector
+	onCloseFunc      func()
 }
 
 type RelayWriter struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	m            MetricsCollector
 	onCloseFunc  func()
 	closed       bool
 	av.RWBaser
@@ -163,14 +174,21 @@ func NewRelayWriter(dstConn *core.ConnClient, srcReader *VirReader, opts optsRel
 		to = time.Second * time.Duration(readTimeout)
 	}
 
+	queueLength := maxQueueNum
+	if opts.IsSynchronizedRW {
+		queueLength = 1
+	}
+	log.Infof("for stream %s queueLength is %v", srcReader.Info().URL, queueLength)
+
 	ret := &RelayWriter{
 		readTimeout:  to,
 		writeTimeout: wt,
 		onCloseFunc:  opts.onCloseFunc,
+		m:            opts.m,
 		RWBaser:      av.NewRWBaser(wt),
 		dstConn:      dstConn,
 		srcReader:    srcReader,
-		packetQueue:  make(chan *av.Packet, maxQueueNum),
+		packetQueue:  make(chan *av.Packet, queueLength),
 	}
 
 	go ret.Check()
@@ -203,7 +221,7 @@ func (v *RelayWriter) Check() {
 }
 
 func (v *RelayWriter) DropPacket(pktQue chan *av.Packet, info av.Info) {
-	log.Warningf("[%v] packet queue max!!!", info)
+	log.Warningf("RelayWriter [%v] packet queue max!!!", info.URL)
 	for i := 0; i < maxQueueNum-84; i++ {
 		tmpPkt, ok := <-pktQue
 		// try to don't drop audio
@@ -245,9 +263,14 @@ func (v *RelayWriter) Write(p *av.Packet) error {
 		}
 	}()
 
+	if len(v.packetQueue) > maxQueueNum/2 {
+		log.Debugf("packageQueue is more than half of max for stream %s, %d", v.srcReader.Info().URL, len(v.packetQueue))
+	}
+
 	if len(v.packetQueue) >= maxQueueNum-24 {
 		v.DropPacket(v.packetQueue, v.Info())
 	} else {
+		v.m.QueueSize(v.srcReader.Info().URL, true)
 		v.packetQueue <- p
 	}
 
@@ -255,32 +278,48 @@ func (v *RelayWriter) Write(p *av.Packet) error {
 }
 
 func (v *RelayWriter) SendPacket() error {
-	var cs core.ChunkStream
+	var (
+		cs         core.ChunkStream
+		sourceName = v.srcReader.Info().URL
+	)
 	for {
 		p, ok := <-v.packetQueue
 		if !ok {
 			return fmt.Errorf("data channel is closed")
 		}
+		v.m.QueueSize(sourceName, false)
 
 		cs.Data = p.Data
 		cs.Length = uint32(len(p.Data))
 		cs.StreamID = v.dstConn.GetStreamId()
 		cs.Timestamp = p.TimeStamp
 
+		pkgType := packageTypeOther
 		if p.IsVideo {
 			cs.TypeID = av.TAG_VIDEO
+			pkgType = packageTypeVideo
 		} else {
 			if p.IsMetadata {
 				cs.TypeID = av.TAG_SCRIPTDATAAMF0
 			} else {
 				cs.TypeID = av.TAG_AUDIO
+				pkgType = packageTypeAudio
 			}
 		}
 
+		ts := time.Now()
 		if err := v.dstConn.Write(cs); err != nil {
 			v.closed = true
-			log.Errorf("can't write packet to destination for stream %v, err %v", v.srcReader.Info().URL, err)
+			log.Errorf("can't write packet to destination for stream %s, err %v", sourceName, err)
 			return err
+		}
+
+		v.m.PackageCounter(sourceName, pkgType)
+		v.m.PackageSize(sourceName, pkgType, int(cs.Length))
+		v.m.WritePackageLatency(sourceName, pkgType, ts)
+
+		if p.IsVideo {
+			log.Debugf("stream %s write spend %s, length %d", sourceName, time.Since(ts).String(), cs.Length)
 		}
 	}
 }
@@ -290,7 +329,7 @@ func (v *RelayWriter) Info() av.Info {
 }
 
 func (v *RelayWriter) Close(err error) {
-	log.Warningf("publisher %v is closed due err %v", v.Info(), err.Error())
+	log.Warningf("publisher %s is closed due err %v", v.Info().URL, err.Error())
 	if !v.closed {
 		close(v.packetQueue)
 	}
@@ -298,3 +337,25 @@ func (v *RelayWriter) Close(err error) {
 	v.onCloseFunc()
 	v.dstConn.Close(err)
 }
+
+const (
+	packageTypeAudio = "audio"
+	packageTypeVideo = "video"
+	packageTypeOther = "other"
+)
+
+type MetricsCollector interface {
+	IncStream(name string)
+	WritePackageLatency(name string, pkgType string, ts time.Time)
+	PackageSize(name string, pkgType string, length int)
+	PackageCounter(name string, pkgType string)
+	QueueSize(name string, isIn bool)
+}
+
+type RelayMetrics struct{}
+
+func (rm *RelayMetrics) IncStream(name string)                                         {}
+func (rm *RelayMetrics) WritePackageLatency(name string, pkgType string, ts time.Time) {}
+func (rm *RelayMetrics) PackageSize(name string, pkgType string, length int)           {}
+func (rm *RelayMetrics) PackageCounter(name string, pkgType string)                    {}
+func (rm *RelayMetrics) QueueSize(name string, isIn bool)                              {}
